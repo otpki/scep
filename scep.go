@@ -1,3 +1,8 @@
+// Copyright (c) 2026 OmniTrust Security LLC. All rights reserved.
+// OmniTrust Security LLC's additions and modifications are licensed under the
+// Apache License, Version 2.0 (see LICENSE-APACHE).
+// Existing third-party code remains under its original terms (see LICENSE).
+
 // Package scep provides common functionality for encoding and decoding
 // Simple Certificate Enrolment Protocol pki messages as defined by
 // https://tools.ietf.org/html/draft-gutmann-scep-02
@@ -9,6 +14,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/asn1"
 	"encoding/base64"
 	"errors"
@@ -124,14 +130,20 @@ type RecipientNonce []byte
 // enrolment, encoded as a PrintableString.
 type TransactionID string
 
-// SCEP OIDs
+// SCEP signed attribute OIDs.
 var (
-	oidSCEPmessageType    = asn1.ObjectIdentifier{2, 16, 840, 1, 113733, 1, 9, 2}
-	oidSCEPpkiStatus      = asn1.ObjectIdentifier{2, 16, 840, 1, 113733, 1, 9, 3}
-	oidSCEPfailInfo       = asn1.ObjectIdentifier{2, 16, 840, 1, 113733, 1, 9, 4}
-	oidSCEPsenderNonce    = asn1.ObjectIdentifier{2, 16, 840, 1, 113733, 1, 9, 5}
-	oidSCEPrecipientNonce = asn1.ObjectIdentifier{2, 16, 840, 1, 113733, 1, 9, 6}
-	oidSCEPtransactionID  = asn1.ObjectIdentifier{2, 16, 840, 1, 113733, 1, 9, 7}
+	// OIDMessageType identifies the SCEP messageType signed attribute.
+	OIDMessageType = asn1.ObjectIdentifier{2, 16, 840, 1, 113733, 1, 9, 2}
+	// OIDPKIStatus identifies the SCEP pkiStatus signed attribute.
+	OIDPKIStatus = asn1.ObjectIdentifier{2, 16, 840, 1, 113733, 1, 9, 3}
+	// OIDFailInfo identifies the SCEP failInfo signed attribute.
+	OIDFailInfo = asn1.ObjectIdentifier{2, 16, 840, 1, 113733, 1, 9, 4}
+	// OIDSenderNonce identifies the SCEP senderNonce signed attribute.
+	OIDSenderNonce = asn1.ObjectIdentifier{2, 16, 840, 1, 113733, 1, 9, 5}
+	// OIDRecipientNonce identifies the SCEP recipientNonce signed attribute.
+	OIDRecipientNonce = asn1.ObjectIdentifier{2, 16, 840, 1, 113733, 1, 9, 6}
+	// OIDTransactionID identifies the SCEP transactionID signed attribute.
+	OIDTransactionID = asn1.ObjectIdentifier{2, 16, 840, 1, 113733, 1, 9, 7}
 )
 
 // WithLogger adds option logging to the SCEP operations.
@@ -161,13 +173,38 @@ func WithCertsSelector(selector CertsSelector) Option {
 	}
 }
 
+// WithContentEncryptionAlgorithm selects encryption for a client request.
+func WithContentEncryptionAlgorithm(algorithm int) Option {
+	return func(c *config) {
+		c.contentEncryptionAlgorithm = &algorithm
+	}
+}
+
+// An option to allow client flexibility in determining how the unique
+// scep transaction id is determined.  Otherwise will default to deriving
+// transactionId from SubjectKey hash
+func WithTransactionId(txId string) Option {
+	return func(c *config) {
+		c.transactionId = TransactionID(txId)
+	}
+}
+
 // Option specifies custom configuration for SCEP.
 type Option func(*config)
 
 type config struct {
-	logger        Logger
-	caCerts       []*x509.Certificate // specified if CA certificates have already been retrieved
-	certsSelector CertsSelector
+	logger                     Logger
+	caCerts                    []*x509.Certificate // specified if CA certificates have already been retrieved
+	certsSelector              CertsSelector
+	transactionId              TransactionID
+	contentEncryptionAlgorithm *int
+}
+
+func (c *config) encrypt(content []byte, recipients []*x509.Certificate) ([]byte, error) {
+	if c.contentEncryptionAlgorithm != nil {
+		return pkcs7.EncryptWithAlgorithm(content, recipients, *c.contentEncryptionAlgorithm)
+	}
+	return pkcs7.Encrypt(content, recipients)
 }
 
 // PKIMessage defines the possible SCEP message types
@@ -177,6 +214,7 @@ type PKIMessage struct {
 	SenderNonce
 	*CertRepMessage
 	*CSRReqMessage
+	*CertPollMessage
 
 	// DER Encoded PKIMessage
 	Raw []byte
@@ -221,6 +259,13 @@ type CSRReqMessage struct {
 	ChallengePassword string
 }
 
+// CertPollMessage is a type of PKIMessage,
+type CertPollMessage struct {
+	Raw     asn1.RawContent
+	Issuer  pkix.RDNSequence
+	Subject pkix.RDNSequence
+}
+
 // ParsePKIMessage unmarshals a PKCS#7 signed data into a PKI message struct
 func ParsePKIMessage(data []byte, opts ...Option) (*PKIMessage, error) {
 	conf := &config{logger: newNopLogger()}
@@ -251,12 +296,12 @@ func ParsePKIMessage(data []byte, opts ...Option) (*PKIMessage, error) {
 	}
 
 	var tID TransactionID
-	if err := p7.UnmarshalSignedAttribute(oidSCEPtransactionID, &tID); err != nil {
+	if err := p7.UnmarshalSignedAttribute(OIDTransactionID, &tID); err != nil {
 		return nil, err
 	}
 
 	var msgType MessageType
-	if err := p7.UnmarshalSignedAttribute(oidSCEPmessageType, &msgType); err != nil {
+	if err := p7.UnmarshalSignedAttribute(OIDMessageType, &msgType); err != nil {
 		return nil, err
 	}
 
@@ -285,11 +330,11 @@ func (msg *PKIMessage) parseMessageType() error {
 	switch msg.MessageType {
 	case CertRep:
 		var status PKIStatus
-		if err := msg.p7.UnmarshalSignedAttribute(oidSCEPpkiStatus, &status); err != nil {
+		if err := msg.p7.UnmarshalSignedAttribute(OIDPKIStatus, &status); err != nil {
 			return err
 		}
 		var rn RecipientNonce
-		if err := msg.p7.UnmarshalSignedAttribute(oidSCEPrecipientNonce, &rn); err != nil {
+		if err := msg.p7.UnmarshalSignedAttribute(OIDRecipientNonce, &rn); err != nil {
 			return err
 		}
 		if len(rn) == 0 {
@@ -304,7 +349,7 @@ func (msg *PKIMessage) parseMessageType() error {
 			break
 		case FAILURE:
 			var fi FailInfo
-			if err := msg.p7.UnmarshalSignedAttribute(oidSCEPfailInfo, &fi); err != nil {
+			if err := msg.p7.UnmarshalSignedAttribute(OIDFailInfo, &fi); err != nil {
 				return err
 			}
 			if fi == "" {
@@ -318,9 +363,9 @@ func (msg *PKIMessage) parseMessageType() error {
 		}
 		msg.CertRepMessage = cr
 		return nil
-	case PKCSReq, UpdateReq, RenewalReq:
+	case PKCSReq, UpdateReq, RenewalReq, CertPoll:
 		var sn SenderNonce
-		if err := msg.p7.UnmarshalSignedAttribute(oidSCEPsenderNonce, &sn); err != nil {
+		if err := msg.p7.UnmarshalSignedAttribute(OIDSenderNonce, &sn); err != nil {
 			return err
 		}
 		if len(sn) == 0 {
@@ -328,7 +373,7 @@ func (msg *PKIMessage) parseMessageType() error {
 		}
 		msg.SenderNonce = sn
 		return nil
-	case GetCRL, GetCert, CertPoll:
+	case GetCRL, GetCert:
 		return errNotImplemented
 	default:
 		return errUnknownMessageType
@@ -391,7 +436,17 @@ func (msg *PKIMessage) DecryptPKIEnvelope(cert *x509.Certificate, key crypto.Pri
 		}
 		logKeyVals = append(logKeyVals, "has_challenge", cp != "")
 		return nil
-	case GetCRL, GetCert, CertPoll:
+	case CertPoll:
+		var poll CertPollMessage
+		rest, err := asn1.Unmarshal(msg.pkiEnvelope, &poll)
+		if err != nil {
+			return fmt.Errorf("scep: unable to unmarshal certpoll message: %w", err)
+		} else if len(rest) != 0 {
+			return errors.New("scep: trailing data in certpoll message")
+		}
+		msg.CertPollMessage = &poll
+		return nil
+	case GetCRL, GetCert:
 		return errNotImplemented
 	default:
 		return errUnknownMessageType
@@ -399,37 +454,41 @@ func (msg *PKIMessage) DecryptPKIEnvelope(cert *x509.Certificate, key crypto.Pri
 }
 
 // Fail returns a new PKIMessage with CertRep data indicating a failure
-func (msg *PKIMessage) Fail(crtAuth *x509.Certificate, keyAuth crypto.PrivateKey, info FailInfo) (*PKIMessage, error) {
+func (msg *PKIMessage) Fail(crtAuth *x509.Certificate, keyAuth crypto.PrivateKey, info FailInfo, options ...ResponseOption) (*PKIMessage, error) {
+	senderNonce, err := newNonce()
+	if err != nil {
+		return nil, err
+	}
 	config := pkcs7.SignerInfoConfig{
 		ExtraSignedAttributes: []pkcs7.Attribute{
 			{
-				Type:  oidSCEPtransactionID,
+				Type:  OIDTransactionID,
 				Value: msg.TransactionID,
 			},
 			{
-				Type:  oidSCEPpkiStatus,
+				Type:  OIDPKIStatus,
 				Value: FAILURE,
 			},
 			{
-				Type:  oidSCEPfailInfo,
+				Type:  OIDFailInfo,
 				Value: info,
 			},
 			{
-				Type:  oidSCEPmessageType,
+				Type:  OIDMessageType,
 				Value: CertRep,
 			},
 			{
-				Type:  oidSCEPsenderNonce,
-				Value: msg.SenderNonce,
+				Type:  OIDSenderNonce,
+				Value: senderNonce,
 			},
 			{
-				Type:  oidSCEPrecipientNonce,
+				Type:  OIDRecipientNonce,
 				Value: msg.SenderNonce,
 			},
 		},
 	}
 
-	sd, err := pkcs7.NewSignedData(nil)
+	sd, err := newResponseSignedData(nil, options)
 	if err != nil {
 		return nil, err
 	}
@@ -446,7 +505,7 @@ func (msg *PKIMessage) Fail(crtAuth *x509.Certificate, keyAuth crypto.PrivateKey
 
 	cr := &CertRepMessage{
 		PKIStatus:      FAILURE,
-		FailInfo:       BadRequest,
+		FailInfo:       info,
 		RecipientNonce: RecipientNonce(msg.SenderNonce),
 	}
 
@@ -455,6 +514,70 @@ func (msg *PKIMessage) Fail(crtAuth *x509.Certificate, keyAuth crypto.PrivateKey
 		Raw:            certRepBytes,
 		TransactionID:  msg.TransactionID,
 		MessageType:    CertRep,
+		SenderNonce:    senderNonce,
+		CertRepMessage: cr,
+	}
+
+	return crepMsg, nil
+}
+
+// Pending returns a new PKIMessage with CertRep data indicating a pending state
+func (msg *PKIMessage) Pending(crtAuth *x509.Certificate, keyAuth crypto.PrivateKey, options ...ResponseOption) (*PKIMessage, error) {
+	senderNonce, err := newNonce()
+	if err != nil {
+		return nil, err
+	}
+	config := pkcs7.SignerInfoConfig{
+		ExtraSignedAttributes: []pkcs7.Attribute{
+			{
+				Type:  OIDTransactionID,
+				Value: msg.TransactionID,
+			},
+			{
+				Type:  OIDPKIStatus,
+				Value: PENDING,
+			},
+			{
+				Type:  OIDMessageType,
+				Value: CertRep,
+			},
+			{
+				Type:  OIDSenderNonce,
+				Value: senderNonce,
+			},
+			{
+				Type:  OIDRecipientNonce,
+				Value: msg.SenderNonce,
+			},
+		},
+	}
+
+	sd, err := newResponseSignedData(nil, options)
+	if err != nil {
+		return nil, err
+	}
+
+	// sign the attributes
+	if err := sd.AddSigner(crtAuth, keyAuth, config); err != nil {
+		return nil, err
+	}
+
+	certRepBytes, err := sd.Finish()
+	if err != nil {
+		return nil, err
+	}
+
+	cr := &CertRepMessage{
+		PKIStatus:      PENDING,
+		RecipientNonce: RecipientNonce(msg.SenderNonce),
+	}
+
+	// create a CertRep message from the original
+	crepMsg := &PKIMessage{
+		Raw:            certRepBytes,
+		TransactionID:  msg.TransactionID,
+		MessageType:    CertRep,
+		SenderNonce:    senderNonce,
 		CertRepMessage: cr,
 	}
 
@@ -462,9 +585,32 @@ func (msg *PKIMessage) Fail(crtAuth *x509.Certificate, keyAuth crypto.PrivateKey
 }
 
 // Success returns a new PKIMessage with CertRep data using an already-issued certificate
-func (msg *PKIMessage) Success(crtAuth *x509.Certificate, keyAuth crypto.PrivateKey, crt *x509.Certificate) (*PKIMessage, error) {
+func (msg *PKIMessage) Success(crtAuth *x509.Certificate, keyAuth crypto.PrivateKey, crt *x509.Certificate, options ...ResponseOption) (*PKIMessage, error) {
+	return msg.success(crtAuth, keyAuth, crt, pkcs7.Encrypt, options)
+}
+
+// SuccessWithRequestEncryption returns a successful CertRep encrypted with the
+// same content encryption algorithm used by the request.
+func (msg *PKIMessage) SuccessWithRequestEncryption(crtAuth *x509.Certificate, keyAuth crypto.PrivateKey, crt *x509.Certificate, options ...ResponseOption) (*PKIMessage, error) {
+	if msg.p7 == nil {
+		return nil, errors.New("scep: request has no parsed PKCS#7 message")
+	}
+	envelope, err := pkcs7.Parse(msg.p7.Content)
+	if err != nil {
+		return nil, err
+	}
+	algorithm, err := envelope.ContentEncryptionAlgorithmID()
+	if err != nil {
+		return nil, err
+	}
+	return msg.success(crtAuth, keyAuth, crt, func(content []byte, recipients []*x509.Certificate) ([]byte, error) {
+		return pkcs7.EncryptWithAlgorithm(content, recipients, algorithm)
+	}, options)
+}
+
+func (msg *PKIMessage) success(crtAuth *x509.Certificate, keyAuth crypto.PrivateKey, crt *x509.Certificate, encrypt func([]byte, []*x509.Certificate) ([]byte, error), options []ResponseOption) (*PKIMessage, error) {
 	// check if CSRReqMessage has already been decrypted
-	if msg.CSR == nil { // TODO(hslatman): remove this; just require decryption before, so that we can make keyAuth a crypto.Signer
+	if msg.MessageType != CertPoll && msg.CSR == nil { // TODO(hslatman): remove this; just require decryption before, so that we can make keyAuth a crypto.Signer
 		if err := msg.DecryptPKIEnvelope(crtAuth, keyAuth); err != nil {
 			return nil, err
 		}
@@ -477,7 +623,11 @@ func (msg *PKIMessage) Success(crtAuth *x509.Certificate, keyAuth crypto.Private
 	}
 
 	// encrypt degenerate data using the original messages recipients
-	e7, err := pkcs7.Encrypt(deg, msg.p7.Certificates)
+	e7, err := encrypt(deg, msg.p7.Certificates)
+	if err != nil {
+		return nil, err
+	}
+	senderNonce, err := newNonce()
 	if err != nil {
 		return nil, err
 	}
@@ -486,29 +636,29 @@ func (msg *PKIMessage) Success(crtAuth *x509.Certificate, keyAuth crypto.Private
 	config := pkcs7.SignerInfoConfig{
 		ExtraSignedAttributes: []pkcs7.Attribute{
 			{
-				Type:  oidSCEPtransactionID,
+				Type:  OIDTransactionID,
 				Value: msg.TransactionID,
 			},
 			{
-				Type:  oidSCEPpkiStatus,
+				Type:  OIDPKIStatus,
 				Value: SUCCESS,
 			},
 			{
-				Type:  oidSCEPmessageType,
+				Type:  OIDMessageType,
 				Value: CertRep,
 			},
 			{
-				Type:  oidSCEPsenderNonce,
-				Value: msg.SenderNonce,
+				Type:  OIDSenderNonce,
+				Value: senderNonce,
 			},
 			{
-				Type:  oidSCEPrecipientNonce,
+				Type:  OIDRecipientNonce,
 				Value: msg.SenderNonce,
 			},
 		},
 	}
 
-	signedData, err := pkcs7.NewSignedData(e7)
+	signedData, err := newResponseSignedData(e7, options)
 	if err != nil {
 		return nil, err
 	}
@@ -538,6 +688,7 @@ func (msg *PKIMessage) Success(crtAuth *x509.Certificate, keyAuth crypto.Private
 		Raw:            certRepBytes,
 		TransactionID:  msg.TransactionID,
 		MessageType:    CertRep,
+		SenderNonce:    senderNonce,
 		CertRepMessage: cr,
 	}
 
@@ -582,7 +733,7 @@ func NewCSRRequest(csr *x509.CertificateRequest, tmpl *PKIMessage, opts ...Optio
 		}
 		return nil, errors.New("scep: no CA/RA recipients")
 	}
-	e7, err := pkcs7.Encrypt(derBytes, recipients)
+	e7, err := conf.encrypt(derBytes, recipients)
 	if err != nil {
 		return nil, err
 	}
@@ -592,8 +743,8 @@ func NewCSRRequest(csr *x509.CertificateRequest, tmpl *PKIMessage, opts ...Optio
 		return nil, err
 	}
 
-	// create transaction ID from public key hash
-	tID, err := newTransactionID(csr.PublicKey)
+	// create transaction ID from public key hash or from config options
+	tID, err := getTransactionID(csr.PublicKey, conf)
 	if err != nil {
 		return nil, err
 	}
@@ -613,15 +764,15 @@ func NewCSRRequest(csr *x509.CertificateRequest, tmpl *PKIMessage, opts ...Optio
 	config := pkcs7.SignerInfoConfig{
 		ExtraSignedAttributes: []pkcs7.Attribute{
 			{
-				Type:  oidSCEPtransactionID,
+				Type:  OIDTransactionID,
 				Value: tID,
 			},
 			{
-				Type:  oidSCEPmessageType,
+				Type:  OIDMessageType,
 				Value: tmpl.MessageType,
 			},
 			{
-				Type:  oidSCEPsenderNonce,
+				Type:  OIDSenderNonce,
 				Value: sn,
 			},
 		},
@@ -654,6 +805,96 @@ func NewCSRRequest(csr *x509.CertificateRequest, tmpl *PKIMessage, opts ...Optio
 	return newMsg, nil
 }
 
+func NewPollRequest(csr *x509.CertificateRequest, tmpl *PKIMessage, opts ...Option) (*PKIMessage, error) {
+	conf := &config{logger: newNopLogger(), certsSelector: NopCertsSelector()}
+	for _, opt := range opts {
+		opt(conf)
+	}
+	recipients := conf.certsSelector.SelectCerts(tmpl.Recipients)
+	if len(recipients) < 1 {
+		if len(tmpl.Recipients) >= 1 {
+			// our certsSelector eliminated any CA/RA recipients
+			return nil, errors.New("scep: no selected CA/RA recipients")
+		}
+		return nil, errors.New("scep: no CA/RA recipients")
+	}
+
+	// Create issuerAndSubject ASN.1 structure
+	msg := CertPollMessage{
+		Issuer:  recipients[0].Issuer.ToRDNSequence(),
+		Subject: csr.Subject.ToRDNSequence(),
+	}
+
+	// Marshal the structure to DER encoding
+	derBytes, err := asn1.Marshal(msg)
+	if err != nil {
+		return nil, fmt.Errorf("scep: error marshaling issuerAndSubject: %w", err)
+	}
+
+	e7, err := conf.encrypt(derBytes, recipients)
+	if err != nil {
+		return nil, err
+	}
+
+	signedData, err := pkcs7.NewSignedData(e7)
+	if err != nil {
+		return nil, err
+	}
+
+	// create transaction ID from public key hash or from config options
+	tID, err := getTransactionID(csr.PublicKey, conf)
+	if err != nil {
+		return nil, err
+	}
+
+	sn, err := newNonce()
+	if err != nil {
+		return nil, err
+	}
+
+	// PKIMessageAttributes to be signed
+	config := pkcs7.SignerInfoConfig{
+		ExtraSignedAttributes: []pkcs7.Attribute{
+			{
+				Type:  OIDTransactionID,
+				Value: tID,
+			},
+			{
+				Type:  OIDMessageType,
+				Value: tmpl.MessageType,
+			},
+			{
+				Type:  OIDSenderNonce,
+				Value: sn,
+			},
+		},
+	}
+
+	// sign attributes
+	if err := signedData.AddSigner(tmpl.SignerCert, tmpl.SignerKey, config); err != nil {
+		return nil, err
+	}
+
+	rawPKIMessage, err := signedData.Finish()
+	if err != nil {
+		return nil, err
+	}
+
+	newMsg := &PKIMessage{
+		Raw:           rawPKIMessage,
+		MessageType:   tmpl.MessageType,
+		TransactionID: tID,
+		SenderNonce:   sn,
+		CertPollMessage: &CertPollMessage{
+			Raw:     derBytes,
+			Issuer:  recipients[0].Issuer.ToRDNSequence(),
+			Subject: csr.Subject.ToRDNSequence(),
+		},
+	}
+
+	return newMsg, nil
+}
+
 func newNonce() (SenderNonce, error) {
 	size := 16
 	b := make([]byte, size)
@@ -662,6 +903,13 @@ func newNonce() (SenderNonce, error) {
 		return SenderNonce{}, err
 	}
 	return SenderNonce(b), nil
+}
+
+func getTransactionID(key crypto.PublicKey, conf *config) (TransactionID, error) {
+	if conf != nil && conf.transactionId != "" {
+		return conf.transactionId, nil
+	}
+	return newTransactionID(key)
 }
 
 // use public key to create a deterministric transactionID

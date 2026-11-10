@@ -1,3 +1,13 @@
+Licensing of this fork
+
+Original SCEP code remains subject to the MIT terms reproduced below.
+Original additions and modifications copyright (c) 2026 OmniTrust Security LLC
+are licensed under the Apache License, Version 2.0; see LICENSE-APACHE.
+Existing third-party notices and license terms remain applicable, including
+Go's BSD license embedded in x509util/x509util.go.
+
+========================================================================
+
 MIT License
 
 Copyright (c) 2016 Victor Vrantchan
