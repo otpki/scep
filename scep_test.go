@@ -1,3 +1,8 @@
+// Copyright (c) 2026 OmniTrust Security LLC. All rights reserved.
+// OmniTrust Security LLC's additions and modifications are licensed under the
+// Apache License, Version 2.0 (see LICENSE-APACHE).
+// Existing third-party code remains under its original terms (see LICENSE).
+
 package scep_test
 
 import (
@@ -20,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/smallstep/pkcs7"
 	"github.com/smallstep/scep"
 	"github.com/smallstep/scep/cryptoutil"
 )
@@ -239,12 +245,39 @@ func TestSignCSR(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	certRep, err := msg.Success(cacert, cakey, crt)
+	certRep, err := msg.SuccessWithRequestEncryption(cacert, cakey, crt)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	testParsePKIMessage(t, certRep.Raw)
+	requestSigned, err := pkcs7.Parse(msg.Raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestEnvelope, err := pkcs7.Parse(requestSigned.Content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestAlgorithm, err := requestEnvelope.ContentEncryptionAlgorithmID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	responseSigned, err := pkcs7.Parse(certRep.Raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	responseEnvelope, err := pkcs7.Parse(responseSigned.Content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	responseAlgorithm, err := responseEnvelope.ContentEncryptionAlgorithmID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if responseAlgorithm != requestAlgorithm {
+		t.Fatalf("response algorithm %d differs from request algorithm %d", responseAlgorithm, requestAlgorithm)
+	}
 }
 
 func TestNewCSRRequest(t *testing.T) {
