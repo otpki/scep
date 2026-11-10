@@ -19,8 +19,7 @@ must replace both upstream SCEP and PKCS7 with the OTPKI forks in its own
 `go.mod`. Replacements in library dependencies do not propagate to consumers.
 
 Replace `SCEP_COMMIT_HASH` with a published migration commit (or tag) and
-`PKCS7_COMMIT_HASH` with a compatible PKCS7 migration commit (currently
-`45c33a79b5c329cd270847682543462666ed1fb3`):
+`PKCS7_COMMIT_HASH` with a compatible published PKCS7 fork commit (or tag):
 
 ```sh
 go mod edit -replace=github.com/smallstep/scep=github.com/otpki/scep@SCEP_COMMIT_HASH
